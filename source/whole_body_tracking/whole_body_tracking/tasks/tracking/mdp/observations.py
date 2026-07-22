@@ -3,12 +3,12 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
+from motrix_envs.torch.adapter.utils.math import matrix_from_quat, subtract_frame_transforms
 
 from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedEnv
+    from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv as ManagerBasedEnv
 
 
 def robot_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

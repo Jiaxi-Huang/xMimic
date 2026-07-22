@@ -1,261 +1,452 @@
-"""Script to play a checkpoint if an RL agent from RSL-RL."""
+"""Play RSL-RL PPO and FastSAC PyTorch checkpoints in MotrixSim."""
 
-"""Launch Isaac Sim Simulator first."""
+from __future__ import annotations
 
 import argparse
-import sys
+import pickle
+import time
+from collections import defaultdict
+from pathlib import Path
 
-from isaaclab.app import AppLauncher
-
-# local imports
-import cli_args  # isort: skip
-
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--play_full_motion",
-    action="store_true",
-    default=False,
-    help="Start the reference motion at phase 0 and stop playback after one full trajectory.",
-)
-parser.add_argument(
-    "--play_env_id",
-    type=int,
-    default=0,
-    help="Environment index to monitor for --play_full_motion stopping condition.",
-)
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
-parser.add_argument(
-    "--keep_running",
-    action="store_true",
-    default=True,
-    help="Prevent automatic exit after video capture or one full motion playback.",
-)
-# append RSL-RL cli arguments
-cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
-args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
-
-# clear out sys.argv for Hydra
-sys.argv = [sys.argv[0]] + hydra_args
-
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
-
-import gymnasium as gym
-import os
-import pathlib
 import numpy as np
 import torch
-
+import whole_body_tracking  # noqa: F401 - register xMimic tasks
 from rsl_rl.runners import OnPolicyRunner
 
-from isaaclab.envs import (
-    DirectMARLEnv,
-    DirectMARLEnvCfg,
-    DirectRLEnvCfg,
-    ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
+from motrix_envs.np.renderer import NpRenderer
+from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv
+from motrix_rl import registry as rl_registry
+from motrix_rl.rslrl.torch import wrap_env
+from motrix_rl.runs import find_metadata_for_policy
+from whole_body_tracking.tasks.tracking.config.dex_evt import make_env_config
+from whole_body_tracking.utils.motrix import TorchManagerNpCompat
+
+
+SUPPORTED_ALGOS = ("rslrl.ppo", "fastsac.async", "fastsac.sync")
+DEFAULT_ENV = "Tracking-Flat-DexEVT-v0"
+DEFAULT_MOTION_FILE = (
+    Path(__file__).resolve().parents[2] / "motion_example" / "dance1_easy.npz"
 )
-from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
-from isaaclab_tasks.utils import get_checkpoint_path
-from isaaclab_tasks.utils.hydra import hydra_task_config
-
-# Import extensions to set up environment tasks
-import whole_body_tracking.tasks  # noqa: F401
-from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
-
-# Reward terms that were recently introduced and should be logged during playbacks.
-_NEW_REWARD_TERMS = ("joint_torque_l2", "joint_vel_limit", "joint_torque_limit")
 
 
-class ClipToLimit(gym.ActionWrapper):
-    """Clip raw actions to a fixed scalar limit before env processing."""
-
-    def __init__(self, env, limit: float):
-        super().__init__(env)
-        self.limit = float(limit)
-
-    def action(self, action):
-        if isinstance(action, torch.Tensor):
-            return torch.clamp(action, -self.limit, self.limit)
-        return np.clip(action, -self.limit, self.limit)
-
-
-def _prepare_full_motion_play(vec_env: RslRlVecEnvWrapper):
-    """Align the motion command with its first frame for deterministic playback."""
-    base_env = getattr(vec_env, "unwrapped", vec_env)
-    command_manager = getattr(base_env, "command_manager", None)
-    if command_manager is None:
-        return None, None
-    try:
-        motion_term = command_manager.get_term("motion")
-    except KeyError:
-        return None, None
-
-    env_ids = torch.arange(motion_term.num_envs, device=motion_term.device, dtype=torch.long)
-    motion_term.time_steps.zero_()
-    horizon_s = float(motion_term.motion.time_step_total) * base_env.step_dt
-    motion_term.time_left[env_ids] = horizon_s
-
-    if horizon_s > base_env.cfg.episode_length_s:
-        base_env.cfg.episode_length_s = horizon_s
-        if hasattr(base_env, "episode_length_buf"):
-            base_env.episode_length_buf.zero_()
-
-    joint_pos = motion_term.joint_pos.clone()
-    joint_vel = motion_term.joint_vel.clone()
-    motion_term.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
-
-    root_state = torch.cat(
-        [
-            motion_term.body_pos_w[:, 0],
-            motion_term.body_quat_w[:, 0],
-            motion_term.body_lin_vel_w[:, 0],
-            motion_term.body_ang_vel_w[:, 0],
-        ],
-        dim=-1,
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--checkpoint", type=Path, required=True, help="PyTorch .pt checkpoint path"
     )
-    motion_term.robot.write_root_state_to_sim(root_state[env_ids], env_ids=env_ids)
-    return motion_term, int(motion_term.motion.time_step_total)
+    parser.add_argument(
+        "--algo",
+        choices=SUPPORTED_ALGOS,
+        help="Policy algorithm (default: infer from run metadata, else rslrl.ppo)",
+    )
+    parser.add_argument(
+        "--env",
+        help=f"Environment name (default: infer from run metadata, else {DEFAULT_ENV})",
+    )
+    parser.add_argument(
+        "--motion-file",
+        "--motion_file",
+        dest="motion_file",
+        type=Path,
+        help="Tracking motion override; needed when replaying a different motion",
+    )
+    parser.add_argument(
+        "--env-config",
+        type=Path,
+        help="Saved env.pkl override (PPO default: RUN/params/env.pkl)",
+    )
+    parser.add_argument(
+        "--agent-config",
+        type=Path,
+        help="Saved agent.pkl override (PPO default: RUN/params/agent.pkl)",
+    )
+    parser.add_argument("--sim-backend", default=None)
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--device", help="Inference device override, e.g. cpu or cuda")
+    parser.add_argument("--activation", choices=("elu", "relu", "tanh"))
+    parser.add_argument(
+        "--action-clip", type=float, help="Clamp policy actions to this magnitude"
+    )
+    parser.add_argument(
+        "--no-realtime",
+        action="store_true",
+        help="Do not pace simulation to control dt",
+    )
+    parser.add_argument(
+        "--headless", action="store_true", help="Run without opening a viewer"
+    )
+    parser.add_argument("--steps", type=int, help="Stop after this many control steps")
+    parser.add_argument(
+        "--report", action="store_true", help="Print rollout and tracking statistics"
+    )
+    return parser
 
 
-def _log_new_reward_terms(vec_env: RslRlVecEnvWrapper, env_idx: int = 0):
-    """Prints the contribution of the newly added reward terms for a representative environment."""
-    reward_manager = getattr(vec_env.unwrapped, "reward_manager", None)
-    if reward_manager is None:
+def _load_pickle(path: Path, description: str):
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{description} not found: {path}")
+    with path.open("rb") as stream:
+        return pickle.load(stream)
+
+
+def _saved_config_path(run_dir: Path, override: Path | None, name: str) -> Path:
+    return override if override is not None else run_dir / "params" / f"{name}.pkl"
+
+
+def _resolve_run(
+    checkpoint: Path,
+) -> tuple[Path, object | None]:
+    found = find_metadata_for_policy(checkpoint)
+    if found is not None:
+        return found
+    return checkpoint.parent, None
+
+
+def _resolve_algo_and_env(
+    args: argparse.Namespace, metadata: object | None
+) -> tuple[str, str]:
+    metadata_algo = None
+    metadata_env = None
+    if metadata is not None:
+        metadata_algo = f"{metadata.rllib}.{metadata.algo}"
+        metadata_env = metadata.env_name
+    algo = args.algo or metadata_algo or "rslrl.ppo"
+    env_name = args.env or metadata_env or DEFAULT_ENV
+    if algo not in SUPPORTED_ALGOS:
+        choices = ", ".join(SUPPORTED_ALGOS)
+        raise ValueError(f"Unsupported algorithm '{algo}'; choose one of: {choices}")
+    return algo, env_name
+
+
+def _set_motion_file(env_cfg, motion_file: Path | None, *, use_default: bool) -> None:
+    motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
+    if motion_file is None and motion_cfg is not None and not motion_cfg.motion_file:
+        if use_default:
+            motion_file = DEFAULT_MOTION_FILE
+            print(
+                "FastSAC run has no saved env.pkl; using default motion "
+                f"{motion_file}. Pass --motion-file to override it."
+            )
+        else:
+            return
+    if motion_file is not None:
+        motion_file = motion_file.expanduser().resolve()
+        if not motion_file.is_file():
+            raise FileNotFoundError(f"Motion file not found: {motion_file}")
+        if motion_cfg is None:
+            raise ValueError("The selected environment does not accept a motion file.")
+        motion_cfg.motion_file = str(motion_file)
+    elif motion_cfg is not None and motion_cfg.motion_file:
+        saved_motion = Path(motion_cfg.motion_file).expanduser()
+        if not saved_motion.is_file():
+            raise FileNotFoundError(
+                f"Saved motion file not found: {saved_motion}. "
+                "Pass --motion-file with an existing .npz file."
+            )
+
+
+def _load_env_cfg(
+    args: argparse.Namespace,
+    run_dir: Path,
+    env_name: str,
+    *,
+    require_saved: bool,
+):
+    path = _saved_config_path(run_dir, args.env_config, "env")
+    if path.expanduser().is_file() or args.env_config is not None:
+        env_cfg = _load_pickle(path, "Environment config")
+        reconstructed = False
+    elif require_saved:
+        raise FileNotFoundError(f"Environment config not found: {path.resolve()}")
+    else:
+        env_cfg = make_env_config(env_name)
+        reconstructed = True
+    for_play = getattr(env_cfg, "for_play", None)
+    if callable(for_play):
+        env_cfg = for_play()
+    _set_motion_file(env_cfg, args.motion_file, use_default=reconstructed)
+    return env_cfg
+
+
+class _RolloutReport:
+    def __init__(self, num_envs: int):
+        self.episode_returns = torch.zeros(num_envs)
+        self.episode_steps = torch.zeros(num_envs, dtype=torch.long)
+        self.completed_returns: list[float] = []
+        self.completed_steps: list[int] = []
+        self.termination_counts: dict[str, int] = defaultdict(int)
+        self.metric_samples: dict[str, list[np.ndarray]] = defaultdict(list)
+        self.action_samples: list[np.ndarray] = []
+
+    def update(self, env, state, actions: torch.Tensor) -> None:
+        rewards = state.reward.detach().cpu()
+        self.episode_returns += rewards
+        self.episode_steps += 1
+        self.action_samples.append(actions.detach().abs().cpu().numpy().reshape(-1))
+
+        done = state.done.detach().cpu()
+        surviving = ~done
+        for group_name, group in env.command_manager.metrics.items():
+            for metric_name, values in group.items():
+                key = f"{group_name}/{metric_name}"
+                samples = values.detach().cpu()[surviving]
+                if samples.numel():
+                    self.metric_samples[key].append(samples.numpy().reshape(-1))
+
+        done_ids = torch.nonzero(done, as_tuple=False).flatten()
+        for env_id in done_ids.tolist():
+            self.completed_returns.append(float(self.episode_returns[env_id]))
+            self.completed_steps.append(int(self.episode_steps[env_id]))
+        if done_ids.numel():
+            self.episode_returns[done_ids] = 0.0
+            self.episode_steps[done_ids] = 0
+
+        for name, values in env.termination_manager.buffers.items():
+            self.termination_counts[name] += int(
+                torch.count_nonzero(values & state.done).item()
+            )
+
+    def print(self, ctrl_dt: float) -> None:
+        print("\nRollout report")
+        print(f"  completed episodes: {len(self.completed_steps)}")
+        if self.completed_steps:
+            steps = np.asarray(self.completed_steps)
+            returns = np.asarray(self.completed_returns)
+            print(
+                f"  episode duration: mean={steps.mean() * ctrl_dt:.3f}s, "
+                f"min={steps.min() * ctrl_dt:.3f}s, max={steps.max() * ctrl_dt:.3f}s"
+            )
+            print(
+                f"  episode return: mean={returns.mean():.4f}, "
+                f"min={returns.min():.4f}, max={returns.max():.4f}"
+            )
+        if self.termination_counts:
+            summary = ", ".join(
+                f"{name}={count}" for name, count in self.termination_counts.items()
+            )
+            print(f"  terminations: {summary}")
+        if self.action_samples:
+            actions = np.concatenate(self.action_samples)
+            print(
+                f"  |action|: mean={actions.mean():.4f}, "
+                f"p95={np.percentile(actions, 95):.4f}, max={actions.max():.4f}"
+            )
+        for name, samples in sorted(self.metric_samples.items()):
+            values = np.concatenate(samples)
+            print(
+                f"  {name}: mean={values.mean():.4f}, "
+                f"p95={np.percentile(values, 95):.4f}, max={values.max():.4f}"
+            )
+
+
+def _renderer_open(renderer) -> bool:
+    return renderer is None or not renderer._render.is_closed
+
+
+def _pace(ctrl_dt: float, start: float, no_realtime: bool) -> None:
+    if no_realtime:
         return
-
-    log_values = []
-    for name, values in reward_manager.get_active_iterable_terms(env_idx=env_idx):
-        if name in _NEW_REWARD_TERMS and len(values) > 0:
-            log_values.append(f"{name}: {values[0]:.4f}")
-
-    # if log_values:
-    #     print(f"[REWARD] env {env_idx} | " + ", ".join(log_values))
+    remaining = ctrl_dt - (time.monotonic() - start)
+    if remaining > 0:
+        time.sleep(remaining)
 
 
-@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
-    """Play with RSL-RL agent."""
-    agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
-
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-
-    if args_cli.motion_file is not None:
-        print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
-
-    # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    log_dir = os.path.dirname(resume_path)
-
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
-    # clip actions to keep inference consistent with training limits from PPO cfg
-    env = ClipToLimit(env, limit=getattr(agent_cfg, "clip_action", np.inf))
-
-    # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env)
-
-    motion_term = None
-    motion_max_steps = None
-    prev_motion_step = None
-    play_env_id = args_cli.play_env_id
-    if args_cli.play_full_motion:
-        motion_term, motion_max_steps = _prepare_full_motion_play(env)
-        if motion_term is not None:
-            play_env_id = max(0, min(play_env_id, motion_term.num_envs - 1))
-            prev_motion_step = motion_term.time_steps[play_env_id].item()
-
-    # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
-    # resolve observation normalizer from actor-critic (rsl_rl >= 2.0)
-    actor_obs_normalizer = getattr(ppo_runner.alg.policy, "actor_obs_normalizer", None)
-
-    # obtain the trained policy for inference
-    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
-
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-
-    export_motion_policy_as_onnx(
-        env.unwrapped,
-        ppo_runner.alg.policy,
-        normalizer=actor_obs_normalizer,
-        path=export_model_dir,
-        filename="policy.onnx",
+def _run_rslrl(
+    args: argparse.Namespace,
+    checkpoint: Path,
+    run_dir: Path,
+    env_name: str,
+) -> None:
+    env_cfg = _load_env_cfg(args, run_dir, env_name, require_saved=True)
+    agent_cfg = _load_pickle(
+        _saved_config_path(run_dir, args.agent_config, "agent"), "Agent config"
     )
-    attach_onnx_metadata(env.unwrapped, "local", export_model_dir)
-    # reset environment
-    obs = env.get_observations()
-    timestep = 0
-    # simulate environment
-    while simulation_app.is_running():
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            actions = policy(obs)
-            # env stepping
-            obs, _, _, _ = env.step(actions)
-        _log_new_reward_terms(env)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length and not args_cli.keep_running:
-                break
-        if args_cli.play_full_motion and motion_term is not None:
-            current_step = motion_term.time_steps[play_env_id].item()
-            if current_step < prev_motion_step and not args_cli.keep_running:
-                break
-            prev_motion_step = current_step
-            if motion_max_steps is not None and current_step >= motion_max_steps - 1 and not args_cli.keep_running:
-                break
+    if args.activation is not None:
+        agent_cfg.actor.activation = args.activation
+        agent_cfg.critic.activation = args.activation
+    if args.device is not None:
+        agent_cfg.device = args.device
+    device = torch.device(agent_cfg.device)
+    env = ManagerBasedTorchEnv(env_cfg, num_envs=args.num_envs)
+    vec_env = wrap_env(TorchManagerNpCompat(env), device)
+    runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=None, device=device)
+    runner.load(
+        str(checkpoint),
+        load_cfg={
+            "actor": True,
+            "critic": False,
+            "optimizer": False,
+            "iteration": False,
+            "rnd": False,
+        },
+        map_location=device,
+    )
+    policy = runner.get_inference_policy(device=device)
+    renderer = None if args.headless else NpRenderer(env)
+    observations = vec_env.get_observations()
+    expected_obs = int(observations["policy"].shape[-1])
+    expected_actions = int(env.action_manager.action_dim)
+    ctrl_dt = env.step_dt
+    print(
+        f"Playing {checkpoint}: algo=rslrl.ppo, env={env_name}, "
+        f"num_envs={args.num_envs}, observations={expected_obs}, "
+        f"actions={expected_actions}; Ctrl+C to stop."
+    )
 
-    # close the simulator
-    env.close()
+    report = _RolloutReport(args.num_envs) if args.report else None
+    step = 0
+    try:
+        while _renderer_open(renderer) and (args.steps is None or step < args.steps):
+            start = time.monotonic()
+            with torch.inference_mode():
+                actions = policy(observations)
+                if args.action_clip is not None:
+                    actions = torch.clamp(actions, -args.action_clip, args.action_clip)
+            observations, _, _, _ = vec_env.step(actions)
+            if report is not None:
+                report.update(env, env._state, actions)
+            if renderer is not None:
+                renderer.render()
+            step += 1
+            _pace(ctrl_dt, start, args.no_realtime)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if report is not None:
+            report.print(ctrl_dt)
+        env.close()
+
+
+def _plain_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    prefix = "_orig_mod."
+    if any(key.startswith(prefix) for key in state_dict):
+        return {key.removeprefix(prefix): value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _fastsac_agent_cfg(args: argparse.Namespace, env_name: str):
+    if args.agent_config is not None:
+        saved_cfg = _load_pickle(args.agent_config, "Agent config")
+        if hasattr(saved_cfg, "runner"):
+            return saved_cfg.runner.agent, getattr(saved_cfg, "device", None)
+        return saved_cfg, None
+
+    # Async and sync FastSAC checkpoints share the same actor/state format. The
+    # xMimic task currently registers its common FastSAC defaults under async.
+    rl_cfg = rl_registry.default_rl_cfg(
+        env_name, "fastsac", train_backend="torch", algo="async"
+    )
+    return rl_cfg.runner.agent, rl_cfg.device
+
+
+def _run_fastsac(
+    args: argparse.Namespace,
+    checkpoint: Path,
+    run_dir: Path,
+    algo: str,
+    env_name: str,
+) -> None:
+    from motrix_rl.fastsac.buffer import EmpiricalNormalization
+    from motrix_rl.fastsac.networks import Actor
+
+    env_cfg = _load_env_cfg(args, run_dir, env_name, require_saved=False)
+    agent_cfg, configured_device = _fastsac_agent_cfg(args, env_name)
+    requested_device = args.device or configured_device
+    if requested_device is None:
+        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA is unavailable; using CPU for FastSAC inference.")
+        requested_device = "cpu"
+    device = torch.device(requested_device)
+
+    env = ManagerBasedTorchEnv(env_cfg, num_envs=args.num_envs)
+    state = env.init_state()
+    observations = state.obs.policy.to(device=device, dtype=torch.float32)
+    obs_dim = int(observations.shape[-1])
+    act_dim = int(env.action_manager.action_dim)
+    action_low = torch.as_tensor(env.action_space.low, dtype=torch.float32)
+    action_high = torch.as_tensor(env.action_space.high, dtype=torch.float32)
+    actor = Actor(
+        n_obs=obs_dim,
+        n_act=act_dim,
+        hidden_dim=agent_cfg.actor_hidden_dim,
+        log_std_max=agent_cfg.log_std_max,
+        log_std_min=agent_cfg.log_std_min,
+        use_tanh=agent_cfg.use_tanh,
+        use_layer_norm=agent_cfg.use_layer_norm,
+        action_scale=(action_high - action_low) / 2.0,
+        action_bias=(action_high + action_low) / 2.0,
+        device=device,
+    )
+    normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
+    checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    actor.load_state_dict(_plain_state_dict(checkpoint_data["actor"]))
+    normalizer.load_state_dict(checkpoint_data["obs_normalizer"])
+    actor.eval()
+    normalizer.eval()
+
+    renderer = None if args.headless else NpRenderer(env)
+    ctrl_dt = env.step_dt
+    print(
+        f"Playing {checkpoint}: algo={algo}, env={env_name}, "
+        f"num_envs={args.num_envs}, observations={obs_dim}, actions={act_dim}, "
+        f"device={device}; Ctrl+C to stop."
+    )
+    report = _RolloutReport(args.num_envs) if args.report else None
+    step = 0
+    try:
+        while _renderer_open(renderer) and (args.steps is None or step < args.steps):
+            start = time.monotonic()
+            with torch.inference_mode():
+                actions = actor.explore(
+                    normalizer(observations, update=False), deterministic=True
+                )
+                if args.action_clip is not None:
+                    actions = torch.clamp(actions, -args.action_clip, args.action_clip)
+            state = env.step(actions.to(device=env.device, dtype=torch.float32))
+            observations = state.obs.policy.to(device=device, dtype=torch.float32)
+            if report is not None:
+                report.update(env, state, actions)
+            if renderer is not None:
+                renderer.render()
+            step += 1
+            _pace(ctrl_dt, start, args.no_realtime)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if report is not None:
+            report.print(ctrl_dt)
+        env.close()
+
+
+def run(args: argparse.Namespace) -> None:
+    checkpoint = args.checkpoint.expanduser().resolve()
+    if checkpoint.suffix != ".pt":
+        raise ValueError(
+            f"play.py expects a .pt checkpoint, got {checkpoint}. "
+            "Use sim2sim_play.py for ONNX."
+        )
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    if args.num_envs < 1:
+        raise ValueError("--num-envs must be at least 1")
+    if args.steps is not None and args.steps < 0:
+        raise ValueError("--steps must be non-negative")
+    if args.sim_backend not in (None, "torch"):
+        raise ValueError("xMimic checkpoints require the MotrixLab Torch backend.")
+
+    run_dir, metadata = _resolve_run(checkpoint)
+    algo, env_name = _resolve_algo_and_env(args, metadata)
+    if algo == "rslrl.ppo":
+        _run_rslrl(args, checkpoint, run_dir, env_name)
+    else:
+        _run_fastsac(args, checkpoint, run_dir, algo, env_name)
+
+
+def main(argv: list[str] | None = None) -> None:
+    run(build_parser().parse_args(argv))
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
-    simulation_app.close()

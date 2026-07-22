@@ -1,6 +1,53 @@
-[build-system]
-requires = ["setuptools", "toml"]
-build-backend = "setuptools.build_meta"
+[project]
+name = "xmimic"
+version = "0.1.0"
+description = "Whole-body motion tracking with MotrixSim and RSL-RL."
+requires-python = "==3.10.*"
+dependencies = [
+    "motrix-envs==0.3.0",
+    "motrix-rl==0.3.0",
+    "motrixsim==0.9.1.dev112911",
+    "motrixsim-core==0.9.1.dev112911+pro",
+    "rsl-rl-lib==5.4.2",
+    "torch===2.7.0+cu128",
+    "torchvision===0.22.0+cu128",
+    "whole-body-tracking==0.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.15,<0.16",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+motrix-envs = { path = "../morphos-lab/motrix_envs", editable = true }
+motrix-rl = { path = "../morphos-lab/motrix_rl", editable = true }
+motrixsim = { index = "motphys" }
+motrixsim-core = { index = "motphys" }
+rsl-rl-lib = { index = "pypi" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+whole-body-tracking = { path = "source/whole_body_tracking", editable = true }
+
+[[tool.uv.index]]
+name = "motphys"
+url = "http://pypi.mp/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
 [tool.isort]
 

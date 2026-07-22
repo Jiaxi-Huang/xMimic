@@ -1,26 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import MISSING
+from dataclasses import dataclass, field
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
-from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
-import isaaclab.terrains as terrain_gen
+from motrix_envs.managers import EventTermCfg as EventTerm
+from motrix_envs.managers import ManagerEnvCfg
+from motrix_envs.managers import ObservationGroupCfg as ObsGroup
+from motrix_envs.managers import ObservationTermCfg as ObsTerm
+from motrix_envs.managers import RewardTermCfg as RewTerm
+from motrix_envs.managers import SceneEntityCfg
+from motrix_envs.managers import TerminationTermCfg as DoneTerm
+from motrix_envs.managers.adapter import SimulationCfg
+from motrix_envs.torch.adapter import ArticulationCfg
+from motrix_envs.torch.adapter.scene import InteractiveSceneCfg
+from motrix_envs.torch.adapter.sensors import ContactSensorCfg
+
 ##
 # Pre-defined configs
 ##
-from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from motrix_envs.managers import AdditiveUniformNoiseCfg as Unoise
 
 import whole_body_tracking.tasks.tracking.mdp as mdp
 
@@ -45,85 +42,13 @@ VELOCITY_RANGE = {
     "yaw": (-0.78, 0.78),
 }
 
-# 轻微斜坡 + 随机起伏地形：用于生成器模式
-GENTLE_SLOPE_NOISE_TERRAIN = TerrainGeneratorCfg(
-    size=(8.0, 8.0),
-    num_rows=5,
-    num_cols=10,
-    horizontal_scale=0.1,
-    vertical_scale=0.005,
-    slope_threshold=0.75,
-    sub_terrains={
-        # 平地：半数子地形近似全平
-        "flat": terrain_gen.HfPyramidSlopedTerrainCfg(
-            proportion=0.5,
-            slope_range=(0.0, 0.0),  # 0 斜率，等价于平面
-            platform_width=8.0,      # 接近子地形尺寸，保证大平面
-            border_width=0.3,
-        ),
-        # 小幅度起伏噪声：1/4
-        "mild_noise": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.25,
-            noise_range=(0.00, 0.05),
-            noise_step=0.01,
-            border_width=0.3,
-        ),
-        # 轻微斜坡：1/4
-        "gentle_slopes": terrain_gen.HfPyramidSlopedTerrainCfg(
-            proportion=0.25,
-            slope_range=(0.05, 0.2),
-            platform_width=3.0,
-            border_width=0.3,
-        ),
-    },
-)
-@configclass
+@dataclass
 class MySceneCfg(InteractiveSceneCfg):
-    """Configuration for the terrain scene with a legged robot."""
+    """Configuration for a robot using a flat-ground scene."""
 
-    def __post_init__(self):
-        super().__post_init__()
-        # robot_cfg = getattr(self, "robot", None)
-        # if robot_cfg in (None, MISSING) or not hasattr(robot_cfg, "init_state"):
-        #     px, py, pz = (0.0, 0.0, 1.0)
-        # else:
-        #     px, py, pz = getattr(robot_cfg.init_state, "pos", (0.0, 0.0, 1.0))
-        # seat_height = 0.45 - self.stool.spawn.size[2] * 0.5
-        # self.stool.init_state.pos = (px - 0.45, py , seat_height)
-
-    # ground terrain
-    terrain = TerrainImporterCfg(
-        prim_path="/World/ground",
-
-        # terrain_type="plane",
-        terrain_type="generator",
-        terrain_generator=GENTLE_SLOPE_NOISE_TERRAIN,
-
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
-        ),
-        visual_material=sim_utils.MdlFileCfg(
-            mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-            project_uvw=True,
-        ),
-    )
-    # robots
-    robot: ArticulationCfg = MISSING
-    # lights
-    light = AssetBaseCfg(
-        prim_path="/World/light",
-        spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
-    )
-    sky_light = AssetBaseCfg(
-        prim_path="/World/skyLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.13, 0.13, 0.13), intensity=1000.0),
-    )
-    contact_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, force_threshold=10.0, debug_vis=True
+    robot: ArticulationCfg | None = None
+    contact_forces: ContactSensorCfg = field(
+        default_factory=lambda: ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*")
     )
 
 
@@ -132,14 +57,13 @@ class MySceneCfg(InteractiveSceneCfg):
 ##
 
 
-@configclass
+@dataclass
 class CommandsCfg:
     """Command specifications for the MDP."""
 
     motion = mdp.MotionCommandCfg(
         asset_name="robot",
         resampling_time_range=(1.0e9, 1.0e9),
-        debug_vis=True,
         pose_range={
             "x": (-0.05, 0.05),
             "y": (-0.05, 0.05),
@@ -153,18 +77,18 @@ class CommandsCfg:
     )
 
 
-@configclass
+@dataclass
 class ActionsCfg:
     """Action specifications for the MDP."""
 
     joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], use_default_offset=True)
 
 
-@configclass
+@dataclass
 class ObservationsCfg:
     """Observation specifications for the MDP."""
 
-    @configclass
+    @dataclass
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
@@ -186,7 +110,7 @@ class ObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
-    @configclass
+    @dataclass
     class PrivilegedCfg(ObsGroup):
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
@@ -200,11 +124,11 @@ class ObservationsCfg:
         actions = ObsTerm(func=mdp.last_action)
 
     # observation groups
-    policy: PolicyCfg = PolicyCfg()
-    critic: PrivilegedCfg = PrivilegedCfg()
+    policy: PolicyCfg = field(default_factory=PolicyCfg)
+    critic: PrivilegedCfg = field(default_factory=PrivilegedCfg)
 
 
-@configclass
+@dataclass
 class EventCfg:
     """Configuration for events."""
 
@@ -284,7 +208,7 @@ class EventCfg:
 
 
 
-@configclass
+@dataclass
 class RewardsCfg:
     """Reward terms for the MDP."""
 
@@ -337,12 +261,13 @@ class RewardsCfg:
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-0.1,
+        enable=False,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
                 body_names=[
-                    # r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
-                    r"^(?!ankle_roll_l_link$)(?!ankle_roll_r_link$)(?!wrist_yaw_l_link$)(?!wrist_yaw_r_link$).+$"
+                    r"^(?!ankle_roll_l_link$)(?!ankle_roll_r_link$)"
+                    r"(?!wrist_yaw_l_link$)(?!wrist_yaw_r_link$).+$"
                 ],
             ),
             "threshold": 1.0,
@@ -350,7 +275,7 @@ class RewardsCfg:
     )
 
 
-@configclass
+@dataclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
@@ -382,7 +307,7 @@ class TerminationsCfg:
     )
 
 
-@configclass
+@dataclass
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
@@ -394,21 +319,25 @@ class CurriculumCfg:
 ##
 
 
-@configclass
-class TrackingEnvCfg(ManagerBasedRLEnvCfg):
+@dataclass
+class TrackingEnvCfg(ManagerEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
 
     # Scene settings
-    scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: MySceneCfg = field(default_factory=lambda: MySceneCfg(num_envs=4096, env_spacing=2.5))
+    sim: SimulationCfg = field(default_factory=SimulationCfg)
+    seed: int | None = None
+    device: str = "cpu"
+    auto_reset: bool = True
     # Basic settings
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: ActionsCfg = ActionsCfg()
-    commands: CommandsCfg = CommandsCfg()
+    observations: ObservationsCfg = field(default_factory=ObservationsCfg)
+    actions: ActionsCfg = field(default_factory=ActionsCfg)
+    commands: CommandsCfg = field(default_factory=CommandsCfg)
     # MDP settings
-    rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
-    events: EventCfg = EventCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    rewards: RewardsCfg = field(default_factory=RewardsCfg)
+    terminations: TerminationsCfg = field(default_factory=TerminationsCfg)
+    events: EventCfg = field(default_factory=EventCfg)
+    curriculum: CurriculumCfg = field(default_factory=CurriculumCfg)
 
     def __post_init__(self):
         """Post initialization."""
@@ -417,10 +346,4 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.episode_length_s = 5.0
         # simulation settings
         self.sim.dt = 0.005
-        self.sim.render_interval = self.decimation
-        self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
-        # viewer settings
-        self.viewer.eye = (1.5, 1.5, 1.5)
-        self.viewer.origin_type = "world"
-        # self.viewer.asset_name = "robot"
+        # self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15

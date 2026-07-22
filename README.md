@@ -1,13 +1,18 @@
 # Xmimic 动作跟踪代码
 
 [![IsaacSim](https://img.shields.io/badge/IsaacSim-5.1-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
-[![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://docs.python.org/3/whatsnew/3.11.html)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-blue.svg)](https://www.python.org/)
 [![Linux platform](https://img.shields.io/badge/platform-linux--64-orange.svg)](https://releases.ubuntu.com/20.04/)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://pre-commit.com/)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/license/mit)
 
 
 ## 安装
+
+项目包含 Isaac Lab 和 MotrixSim 两套运行路径。二者的 Python 版本与依赖不同，
+请按目标后端选择下面的安装流程，不要共用同一个虚拟环境。
+
+### Isaac Lab 后端
 
 - 根据 [Isaac Lab 安装指南](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html)安装 Isaac Lab，并将环境版本对齐到以下当前验证版本。推荐使用 conda 方式安装，便于后续在终端中直接调用 Python 脚本。
 
@@ -33,6 +38,103 @@ python -m pip install -e source/whole_body_tracking
 ```
 
 ## 动作跟踪
+
+### MotrixSim 后端（uv）
+
+仓库通过 Git LFS 内置 `motrix_envs` 和 `motrix_rl` wheel。两个 wheel 构建自
+`morphos-lab` 的 `163-add-torch-manager-backend` 分支；具体提交、校验和及重建命令见
+[`packages/README.md`](packages/README.md)。DexEVT tracking task、机器人配置与
+URDF/mesh 由本仓库的 `source/whole_body_tracking` 提供。
+
+环境由根目录的 `pyproject.toml` 和 `uv.lock` 统一管理，要求 Linux x86_64 和
+Python 3.10。无需手动创建 venv，也不要再通过 `requirements-motrix.txt` 安装。
+
+首次克隆及安装：
+
+```bash
+# 克隆后先拉取 Git LFS 中的 wheel
+git lfs install
+git lfs pull
+
+# 按 uv.lock 创建 .venv 并安装全部运行/开发依赖
+uv sync --frozen
+```
+
+如果机器设置了全局 `UV_INDEX_URL` 等自定义镜像，导致构建依赖仍被导向其他源，
+可显式指定官方 PyPI：
+
+```bash
+uv sync --frozen --default-index https://pypi.org/simple
+```
+
+仅安装运行依赖、不安装 pytest/ruff：
+
+```bash
+uv sync --frozen --no-dev
+```
+
+uv 会读取 `.python-version`，自动选择 Python 3.10。平时无需激活虚拟环境，统一用
+`uv run` 执行命令。如需进入环境，可运行 `source .venv/bin/activate`。
+
+验证安装来源和关键版本：
+
+```bash
+uv run python -c "import sys, torch, motrix_envs, motrix_rl, whole_body_tracking; \
+print(sys.executable); print(torch.__version__); print(motrix_envs.__file__); \
+print(motrix_rl.__file__); print(whole_body_tracking.__file__)"
+```
+
+其中 `motrix_envs` 和 `motrix_rl` 应从 `.venv/site-packages` 加载，
+`whole_body_tracking` 应指向本仓库的 `source/whole_body_tracking`。
+
+依赖变更后使用以下流程更新锁文件和环境：
+
+```bash
+uv lock --default-index https://pypi.org/simple
+uv sync --frozen --default-index https://pypi.org/simple
+```
+
+查看环境（未指定 motion 时默认使用 `motion_example/dance1_easy.npz`）：
+
+```bash
+uv run scripts/rsl_rl/view.py \
+  --env=Tracking-Flat-DexEVT-Wo-State-Estimation-v0 --num-envs=1
+
+uv run scripts/rsl_rl/view.py \
+  --env=Tracking-Flat-DexEVT-Wo-State-Estimation-v0 \
+  --motion-file=motion_data/{motion_name}.npz
+```
+
+快速验证训练链路（每轮 `16 × 24 = 384` 个 transition）：
+
+```bash
+uv run scripts/rsl_rl/train.py \
+  --task Tracking-Flat-DexEVT-Wo-State-Estimation-v0 \
+  --num_envs 1024 \
+  --max_iterations 20000 \
+  --motion_file motion_data/{motion_name}.npz
+  --algo fastsac.async #rslrl.ppo
+```
+
+正式训练前按 CPU 和内存逐步测试 `256`、`512`、`1024` env，并按实际
+transition 数而不是 iteration 数与 IsaacLab 对比。每次 run 会在
+`params/run.json` 保存实际 env 数、task、actor/critic 维度、仿真时间步、依赖版本和
+motion SHA-256，checkpoint 回放时应以该文件为准。
+
+旧 xMimic Motion NPZ 使用 IsaacLab 的 joint/body 顺序和 `wxyz` 四元数。
+`MotionLoader` 会先映射到 Motrix runtime 的 joint/body 顺序；MotrixSim 原生的
+`xyzw` 与 torch 侧 `wxyz` 之间的转换由 `motrix_envs` simulator 边界负责。
+
+
+回放训练产生的 PyTorch checkpoint：
+
+```bash
+uv run scripts/rsl_rl/play.py \
+    --checkpoint <checkpoint>.pt \
+    --env Tracking-Flat-DexEVT-Wo-State-Estimation-v0 \
+    --num-envs 12 \
+    --algo fastsac.async #rslrl.ppo
+```
 
 ### 动作预处理
 
@@ -89,12 +191,11 @@ python scripts/gmr_to_npz_inter.py \
 - 指定运动文件训练 policy:
 
 ```bash
-python scripts/rsl_rl/train.py --task=Tracking-Flat-DexEVT-Wo-State-Estimation-v0 \
---num_envs 4096 \
---max_iterations 100000 \
---device cuda:0 \
---motion_file motion_data/{motion_name}.npz \
---headless --logger tensorboard 
+uv run scripts/rsl_rl/train.py \
+--task Tracking-Flat-DexEVT-Wo-State-Estimation-v0 \
+--num_envs 1024 \
+--max_iterations 1000 \
+--motion_file motion_data/{motion_name}.npz
 ```
 
 ### 策略评估
@@ -102,10 +203,10 @@ python scripts/rsl_rl/train.py --task=Tracking-Flat-DexEVT-Wo-State-Estimation-v
 - 使用以下命令运行训练好的 policy:
 
 ```bash
-python scripts/rsl_rl/play.py \
---task=Tracking-Flat-DexEVT-Wo-State-Estimation-v0 --num_envs=2 \
---load_run={run_folder_regex} --checkpoint={checkpoint_regex} \
---motion_file motion_data/{motion_name}.npz
+uv run scripts/rsl_rl/play.py \
+--env Tracking-Flat-DexEVT-Wo-State-Estimation-v0 \
+--num-envs 2 \
+--checkpoint logs/rsl_rl/dex_evt_flat/{run}/model_{iteration}.pt
 ```
 
 ### 启动 MuJoCo 仿真

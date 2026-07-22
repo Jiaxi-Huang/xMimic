@@ -1,6 +1,7 @@
 """This sub-module contains the functions that are specific to the locomotion environments."""
 
-from isaaclab.envs.mdp import *  # noqa: F401, F403
+from motrix_envs.mdp import *  # noqa: F401, F403
+from motrix_envs.mdp.torch import *  # noqa: F401, F403
 
 from whole_body_tracking.tasks.tracking.mdp import *  # noqa: F401, F403
 
