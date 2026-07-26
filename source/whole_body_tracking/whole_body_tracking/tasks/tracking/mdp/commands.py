@@ -4,16 +4,11 @@ import numpy as np
 import os
 import torch
 from collections.abc import Sequence
-from dataclasses import MISSING
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import Articulation
-from isaaclab.managers import CommandTerm, CommandTermCfg
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.markers.config import FRAME_MARKER_CFG
-from isaaclab.utils import configclass
-from isaaclab.utils.math import (
-    matrix_from_quat,
+from motrix_envs.managers import CommandTerm, CommandTermCfg
+from motrix_envs.torch.adapter.utils.math import (
     quat_apply,
     quat_error_magnitude,
     quat_from_euler_xyz,
@@ -24,16 +19,50 @@ from isaaclab.utils.math import (
 )
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+    from motrix_envs.torch.adapter.articulation import Articulation
+    from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv as ManagerBasedRLEnv
+
+_NPZ_BODY_NAMES = (
+    "pelvis",
+    "hip_pitch_l_link", "hip_pitch_r_link", "imu_waist_link", "waist_yaw_link",
+    "hip_roll_l_link", "hip_roll_r_link", "waist_roll_link",
+    "hip_yaw_l_link", "hip_yaw_r_link", "waist_pitch_link",
+    "knee_pitch_l_link", "knee_pitch_r_link", "camera_body_front_link",
+    "head_yaw_link", "imu_head_link", "radar_head_link",
+    "shoulder_pitch_l_link", "shoulder_pitch_r_link",
+    "ankle_pitch_l_link", "ankle_pitch_r_link", "head_pitch_link",
+    "shoulder_roll_l_link", "shoulder_roll_r_link",
+    "ankle_roll_l_link", "ankle_roll_r_link", "camera_head_link",
+    "shoulder_yaw_l_link", "shoulder_yaw_r_link",
+    "elbow_pitch_l_link", "elbow_pitch_r_link",
+    "elbow_yaw_l_link", "elbow_yaw_r_link",
+    "wrist_pitch_l_link", "wrist_pitch_r_link",
+    "wrist_roll_l_link", "wrist_roll_r_link", "left_tcp_link", "right_tcp_link",
+)
+
+_NPZ_JOINT_NAMES = (
+    "hip_pitch_l_joint", "hip_pitch_r_joint", "waist_yaw_joint",
+    "hip_roll_l_joint", "hip_roll_r_joint", "waist_roll_joint",
+    "hip_yaw_l_joint", "hip_yaw_r_joint", "waist_pitch_joint",
+    "knee_pitch_l_joint", "knee_pitch_r_joint",
+    "shoulder_pitch_l_joint", "shoulder_pitch_r_joint",
+    "ankle_pitch_l_joint", "ankle_pitch_r_joint",
+    "shoulder_roll_l_joint", "shoulder_roll_r_joint",
+    "ankle_roll_l_joint", "ankle_roll_r_joint",
+    "shoulder_yaw_l_joint", "shoulder_yaw_r_joint",
+    "elbow_pitch_l_joint", "elbow_pitch_r_joint",
+)
 
 
 class MotionLoader:
-    def __init__(self, motion_file: str, body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self, motion_file: str, joint_indexes: Sequence[int], body_indexes: Sequence[int], device: str = "cpu"
+    ):
         assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
         data = np.load(motion_file)
-        self.fps = data["fps"]
-        self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-        self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
+        self.fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+        self.joint_pos = torch.tensor(data["joint_pos"][:, joint_indexes], dtype=torch.float32, device=device)
+        self.joint_vel = torch.tensor(data["joint_vel"][:, joint_indexes], dtype=torch.float32, device=device)
         self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
         self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
         self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
@@ -71,7 +100,18 @@ class MotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        self.motion = MotionLoader(self.cfg.motion_file, self.body_indexes, device=self.device)
+        motion_joint_indexes = [_NPZ_JOINT_NAMES.index(name) for name in self.robot.joint_names]
+        motion_body_indexes = [_NPZ_BODY_NAMES.index(name) for name in self.cfg.body_names]
+        self.motion = MotionLoader(
+            self.cfg.motion_file, motion_joint_indexes, motion_body_indexes, device=self.device
+        )
+        motion_steps_per_control_step = self.motion.fps * env.step_dt
+        self.motion_step_stride = max(int(round(motion_steps_per_control_step)), 1)
+        if not np.isclose(motion_steps_per_control_step, self.motion_step_stride):
+            raise ValueError(
+                "Motion FPS must be an integer multiple of the environment control frequency: "
+                f"fps={self.motion.fps}, ctrl_dt={env.step_dt}."
+            )
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
@@ -227,16 +267,23 @@ class MotionCommand(CommandTerm):
         joint_pos[env_ids] = torch.clip(
             joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
         )
-        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
-        self.robot.write_root_state_to_sim(
-            torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
+        root_state = torch.cat(
+            [root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1
+        )
+        self.robot.write_root_and_joint_state_to_sim(
+            root_state,
+            joint_pos[env_ids],
+            joint_vel[env_ids],
             env_ids=env_ids,
         )
 
     def _update_command(self):
-        self.time_steps += 1
-        env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
-        self._resample_command(env_ids)
+        self.time_steps += self.motion_step_stride
+        # Clip completion is handled as a normal episode truncation. Keep the
+        # final valid reference here until the environment resets the command;
+        # resampling during a step update would otherwise teleport the robot
+        # between the transition reward and its next observation.
+        self.time_steps.clamp_(max=self.motion.time_step_total - 1)
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -250,75 +297,19 @@ class MotionCommand(CommandTerm):
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
 
-    def _set_debug_vis_impl(self, debug_vis: bool):
-        if debug_vis:
-            if not hasattr(self, "current_anchor_visualizer"):
-                self.current_anchor_visualizer = VisualizationMarkers(
-                    self.cfg.anchor_visualizer_cfg.replace(prim_path="/Visuals/Command/current/anchor")
-                )
-                self.goal_anchor_visualizer = VisualizationMarkers(
-                    self.cfg.anchor_visualizer_cfg.replace(prim_path="/Visuals/Command/goal/anchor")
-                )
-
-                self.current_body_visualizers = []
-                self.goal_body_visualizers = []
-                for name in self.cfg.body_names:
-                    self.current_body_visualizers.append(
-                        VisualizationMarkers(
-                            self.cfg.body_visualizer_cfg.replace(prim_path="/Visuals/Command/current/" + name)
-                        )
-                    )
-                    self.goal_body_visualizers.append(
-                        VisualizationMarkers(
-                            self.cfg.body_visualizer_cfg.replace(prim_path="/Visuals/Command/goal/" + name)
-                        )
-                    )
-
-            self.current_anchor_visualizer.set_visibility(True)
-            self.goal_anchor_visualizer.set_visibility(True)
-            for i in range(len(self.cfg.body_names)):
-                self.current_body_visualizers[i].set_visibility(True)
-                self.goal_body_visualizers[i].set_visibility(True)
-
-        else:
-            if hasattr(self, "current_anchor_visualizer"):
-                self.current_anchor_visualizer.set_visibility(False)
-                self.goal_anchor_visualizer.set_visibility(False)
-                for i in range(len(self.cfg.body_names)):
-                    self.current_body_visualizers[i].set_visibility(False)
-                    self.goal_body_visualizers[i].set_visibility(False)
-
-    def _debug_vis_callback(self, event):
-        if not self.robot.is_initialized:
-            return
-
-        self.current_anchor_visualizer.visualize(self.robot_anchor_pos_w, self.robot_anchor_quat_w)
-        self.goal_anchor_visualizer.visualize(self.anchor_pos_w, self.anchor_quat_w)
-
-        for i in range(len(self.cfg.body_names)):
-            self.current_body_visualizers[i].visualize(self.robot_body_pos_w[:, i], self.robot_body_quat_w[:, i])
-            self.goal_body_visualizers[i].visualize(self.body_pos_relative_w[:, i], self.body_quat_relative_w[:, i])
-
-
-@configclass
+@dataclass
 class MotionCommandCfg(CommandTermCfg):
     """Configuration for the motion command."""
 
     class_type: type = MotionCommand
 
-    asset_name: str = MISSING
+    asset_name: str = ""
 
-    motion_file: str = MISSING
-    anchor_body: str = MISSING
-    body_names: list[str] = MISSING
+    motion_file: str = ""
+    anchor_body: str = ""
+    body_names: list[str] = field(default_factory=list)
 
-    pose_range: dict[str, tuple[float, float]] = {}
-    velocity_range: dict[str, tuple[float, float]] = {}
+    pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
+    velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
-
-    anchor_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
-    anchor_visualizer_cfg.markers["frame"].scale = (0.2, 0.2, 0.2)
-
-    body_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
-    body_visualizer_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)

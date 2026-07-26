@@ -3,13 +3,12 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING, Literal
 
-import isaaclab.utils.math as math_utils
-from isaaclab.assets import Articulation
-from isaaclab.envs.mdp.events import _randomize_prop_by_op
-from isaaclab.managers import SceneEntityCfg
+from motrix_envs.mdp.torch.events import randomize_prop_by_op as _randomize_prop_by_op
+from motrix_envs.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedEnv
+    from motrix_envs.torch.adapter.articulation import Articulation
+    from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv as ManagerBasedEnv
 
 
 def randomize_joint_default_pos(
@@ -30,26 +29,24 @@ def randomize_joint_default_pos(
     asset.data.default_joint_pos_nominal = torch.clone(asset.data.default_joint_pos[0])
 
     # resolve environment ids
-    if env_ids is None:
-        env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+    env_ids = env.resolve_env_ids(env_ids)
 
     # resolve joint indices
-    if asset_cfg.joint_ids == slice(None):
-        joint_ids = slice(None)  # for optimization purposes
-    else:
-        joint_ids = torch.tensor(asset_cfg.joint_ids, dtype=torch.int, device=asset.device)
+    if asset_cfg.joint_names is None:
+        raise ValueError("randomize_joint_default_pos requires resolved joint_names.")
+    joint_ids = asset.find_joints(asset_cfg.joint_names, preserve_order=True)[0]
 
     if pos_distribution_params is not None:
-        pos = asset.data.default_joint_pos.to(asset.device).clone()
         pos = _randomize_prop_by_op(
-            pos, pos_distribution_params, env_ids, joint_ids, operation=operation, distribution=distribution
+            asset.data.default_joint_pos.clone(),
+            pos_distribution_params,
+            env_ids,
+            joint_ids,
+            operation=operation,
+            distribution=distribution,
+            rng=env.get_rng("event"),
         )[env_ids][:, joint_ids]
-
-        if env_ids != slice(None) and joint_ids != slice(None):
-            env_ids = env_ids[:, None]
-        asset.data.default_joint_pos[env_ids, joint_ids] = pos
-        # update the offset in action since it is not updated automatically
-        env.action_manager.get_term("joint_pos")._offset[env_ids, joint_ids] = pos
+        asset.set_default_joint_positions(asset_cfg.joint_names, pos, env_ids=env_ids)
 
 
 def align_stairs_with_envs(
@@ -124,28 +121,18 @@ def randomize_rigid_body_com(
     """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    # resolve environment ids
-    if env_ids is None:
-        env_ids = torch.arange(env.scene.num_envs, device="cpu")
-    else:
-        env_ids = env_ids.cpu()
-
-    # resolve body indices
-    if asset_cfg.body_ids == slice(None):
-        body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
-    else:
-        body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
-
-    # sample random CoM values
+    if asset_cfg.body_ids is None:
+        raise ValueError("randomize_rigid_body_com requires resolved body_ids.")
+    env_ids = env.resolve_env_ids(env_ids)
     range_list = [com_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
-    ranges = torch.tensor(range_list, device="cpu")
-    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device="cpu").unsqueeze(1)
-
-    # get the current com of the bodies (num_assets, num_bodies)
-    coms = asset.root_physx_view.get_coms().clone()
-
-    # Randomize the com in range
-    coms[:, body_ids, :3] += rand_samples
-
-    # Set the new coms
-    asset.root_physx_view.set_coms(coms, env_ids)
+    ranges = torch.tensor(range_list, device=env.device)
+    offsets = _randomize_prop_by_op(
+        torch.zeros((len(env_ids), 3), device=env.device),
+        (ranges[:, 0], ranges[:, 1]),
+        None,
+        slice(None),
+        operation="abs",
+        distribution="uniform",
+        rng=env.get_rng("event"),
+    )
+    asset.set_center_of_mass_offsets(asset_cfg.body_ids, offsets, env_ids=env_ids)

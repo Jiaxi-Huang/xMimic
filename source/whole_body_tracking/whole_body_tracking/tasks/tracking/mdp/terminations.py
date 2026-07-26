@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import torch
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import isaaclab.utils.math as math_utils
+import motrix_envs.torch.adapter.utils.math as math_utils
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+    from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv as ManagerBasedRLEnv
 
-from isaaclab.assets import Articulation, RigidObject
-from isaaclab.managers import SceneEntityCfg
+from motrix_envs.torch.adapter.articulation import Articulation
+from motrix_envs.managers import SceneEntityCfg
 
 from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
 from whole_body_tracking.tasks.tracking.mdp.rewards import _get_body_indexes
+
+RigidObject = Any
 
 
 def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
@@ -23,6 +25,12 @@ def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) 
 def bad_anchor_pos_z_only(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     return torch.abs(command.anchor_pos_w[:, -1] - command.robot_anchor_pos_w[:, -1]) > threshold
+
+
+def motion_clip_end(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Truncate before advancing beyond the final motion frame."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return command.time_steps + command.motion_step_stride >= command.motion.time_step_total
 
 
 def bad_anchor_ori(

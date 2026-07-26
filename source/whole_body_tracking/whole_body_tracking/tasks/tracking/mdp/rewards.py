@@ -3,15 +3,15 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import Articulation
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_error_magnitude
+from motrix_envs.torch.adapter.articulation import Articulation
+from motrix_envs.managers import SceneEntityCfg
+from motrix_envs.torch.adapter.sensors import ContactSensor
+from motrix_envs.torch.adapter.utils.math import quat_error_magnitude
 
 from whole_body_tracking.tasks.tracking.mdp.commands import MotionCommand
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+    from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv as ManagerBasedRLEnv
 
 
 def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> list[int]:

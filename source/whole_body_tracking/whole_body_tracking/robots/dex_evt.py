@@ -1,32 +1,12 @@
-import isaaclab.sim as sim_utils
-from isaaclab.assets.articulation import ArticulationCfg
+from motrix_envs.managers.adapter import UrdfFileCfg
+from motrix_envs.torch.adapter import ArticulationCfg
 
 from whole_body_tracking.assets import ASSET_DIR
 from whole_body_tracking.robots.actuator import DelayedImplicitActuatorCfg
 
-
 DEX_EVT_CFG = ArticulationCfg(
-    spawn=sim_utils.UrdfFileCfg(
-        fix_base=False,
-        replace_cylinders_with_capsules=True,
-        asset_path=f"{ASSET_DIR}/dex_evt/urdf/tiangong2dex.urdf",
-        activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True, solver_position_iteration_count=8, solver_velocity_iteration_count=4
-        ),
-        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
-        ),
-    ),
+    spawn=UrdfFileCfg(asset_path=f"{ASSET_DIR}/dex_evt/urdf/tiangong2dex.urdf"),
+    body_name="pelvis",
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.95),
         joint_pos={
@@ -66,7 +46,8 @@ DEX_EVT_CFG = ArticulationCfg(
     actuators = {
         "legs": DelayedImplicitActuatorCfg(
             min_delay=0,
-            max_delay=4,
+            max_delay=0,#4,
+            armature=0.03,
             joint_names_expr=[
                 ".*hip_yaw.*joint",
                 ".*hip_roll.*joint",
@@ -105,7 +86,8 @@ DEX_EVT_CFG = ArticulationCfg(
 
         "feet": DelayedImplicitActuatorCfg(
             min_delay=0,
-            max_delay=4,
+            max_delay=0,#4,
+            armature=0.03,
             joint_names_expr=[
                 ".*ankle_pitch.*joint",
                 ".*ankle_roll.*joint",
@@ -132,7 +114,8 @@ DEX_EVT_CFG = ArticulationCfg(
 
         "waist": DelayedImplicitActuatorCfg(
             min_delay=0,
-            max_delay=4,
+            max_delay=0,#4,
+            armature=0.03,
             joint_names_expr=[
                 "waist_yaw_joint", 
                 "waist_roll_joint",
@@ -165,7 +148,8 @@ DEX_EVT_CFG = ArticulationCfg(
 
         "arms": DelayedImplicitActuatorCfg(
             min_delay=0,
-            max_delay=4,
+            max_delay=0,#4,
+            armature=0.03,
             joint_names_expr=[
                 ".*shoulder_pitch.*joint",
                 ".*shoulder_roll.*joint",

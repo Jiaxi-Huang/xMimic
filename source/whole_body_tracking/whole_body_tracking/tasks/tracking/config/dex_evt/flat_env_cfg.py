@@ -1,8 +1,39 @@
-from isaaclab.utils import configclass
+from dataclasses import replace
 
-from whole_body_tracking.robots.dex_evt import D3_ACTION_SCALE, DEX_EVT_CFG
+from motrix_envs.torch.adapter.utils import configclass
+# from whole_body_tracking.robots.dex_evt import D3_ACTION_SCALE
+from whole_body_tracking.robots.dex_evt import DEX_EVT_CFG
 from whole_body_tracking.tasks.tracking.config.dex_evt.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
 from whole_body_tracking.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
+
+
+# Match morphos-lab's DexEvtWbtControlConfig. Normalized [-1, 1] actions
+# cover the maximum distance from the default pose to either hard joint limit.
+_MORPHOS_ACTION_SCALE = {
+    "hip_pitch_l_joint": 3.1297900676727295,
+    "hip_roll_l_joint": 2.617990016937256,
+    "hip_yaw_l_joint": 4.537859916687012,
+    "knee_pitch_l_joint": 2.0307300090789795,
+    "ankle_pitch_l_joint": 0.9717299938201904,
+    "ankle_roll_l_joint": 0.5235990285873413,
+    "hip_pitch_r_joint": 3.1297900676727295,
+    "hip_roll_r_joint": 2.617990016937256,
+    "hip_yaw_r_joint": 4.537859916687012,
+    "knee_pitch_r_joint": 2.0307300090789795,
+    "ankle_pitch_r_joint": 0.9717299938201904,
+    "ankle_roll_r_joint": 0.5235990285873413,
+    "waist_yaw_joint": 3.2288599014282227,
+    "waist_roll_joint": 0.43633198738098145,
+    "waist_pitch_joint": 0.9599310159683228,
+    "shoulder_pitch_l_joint": 2.967060089111328,
+    "shoulder_roll_l_joint": 3.1033899784088135,
+    "shoulder_yaw_l_joint": 2.967060089111328,
+    "elbow_pitch_l_joint": 2.3179900646209717,
+    "shoulder_pitch_r_joint": 2.967060089111328,
+    "shoulder_roll_r_joint": 3.1033899784088135,
+    "shoulder_yaw_r_joint": 2.967060089111328,
+    "elbow_pitch_r_joint": 2.3179900646209717,
+}
 
 
 class DexEVTFlatEnvConfig(TrackingEnvCfg):
@@ -11,10 +42,16 @@ class DexEVTFlatEnvConfig(TrackingEnvCfg):
 
         # Update the robot configuration
         self.scene.robot = DEX_EVT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.actions.joint_pos.scale = D3_ACTION_SCALE
+        self.actions.joint_pos = replace(self.actions.joint_pos)
+        # self.actions.joint_pos.scale = D3_ACTION_SCALE
+        # self.actions.joint_pos.clip = None
+        self.actions.joint_pos.scale = dict(_MORPHOS_ACTION_SCALE)
+        self.actions.joint_pos.clip = (-1.0, 1.0)
 
         # Set the anchor body for motion commands
-        self.commands.motion.anchor_body = "pelvis"
+        self.commands.motion = replace(self.commands.motion)
+        # self.commands.motion.anchor_body = "pelvis"
+        self.commands.motion.anchor_body = "waist_pitch_link"
 
         # Define the body names based on the URDF structure
         self.commands.motion.body_names = [
@@ -55,8 +92,11 @@ class DexEVTFlatEnvConfig(TrackingEnvCfg):
 class DexEVTFlatWoStateEstimationEnvCfg(DexEVTFlatEnvConfig):
     def __post_init__(self):
         super().__post_init__()
-        self.observations.policy.motion_anchor_pos_b = None
-        self.observations.policy.base_lin_vel = None
+        self.observations.policy.motion_anchor_pos_b = replace(
+            self.observations.policy.motion_anchor_pos_b,
+            enable=False,
+        )
+        self.observations.policy.base_lin_vel = replace(self.observations.policy.base_lin_vel, enable=False)
 
 
 @configclass
