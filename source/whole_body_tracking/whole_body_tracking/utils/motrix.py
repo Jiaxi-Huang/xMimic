@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 
 from motrix_envs.np.env import NpEnvState, NpObs
+from motrix_envs.torch.env import TorchEnvState
 from motrix_envs.torch.manager_based_env import ManagerBasedTorchEnv
-from motrix_envs.torch.state import TorchEnvState
 from motrix_rl.rslrl.torch import RslrlNpEnvWrap
 
 

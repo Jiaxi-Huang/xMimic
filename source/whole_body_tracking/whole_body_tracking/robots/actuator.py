@@ -3,7 +3,7 @@ from __future__ import annotations
 
 
 
-from motrix_envs.torch.adapter.actuators import ImplicitActuatorCfg
+from motrix_envs.managers.adapter import ImplicitActuatorCfg
 from motrix_envs.torch.adapter.utils import configclass
 
 
@@ -27,11 +27,11 @@ from motrix_envs.torch.adapter.utils import configclass
 #    def __init__(self, cfg: DelayedImplicitActuatorCfg, *args, **kwargs):
 #        super().__init__(cfg, *args, **kwargs)
 #        # instantiate the delay buffers
-#        self.positions_delay_buffer = DelayBuffer(cfg.max_delay, self._num_envs, device=self._device)
-#        self.velocities_delay_buffer = DelayBuffer(cfg.max_delay, self._num_envs, device=self._device)
-#        self.efforts_delay_buffer = DelayBuffer(cfg.max_delay, self._num_envs, device=self._device)
+#        self.positions_delay_buffer = DelayBuffer(cfg.max_delay, self._num_envs, device=self.device)
+#        self.velocities_delay_buffer = DelayBuffer(cfg.max_delay, self._num_envs, device=self.device)
+#        self.efforts_delay_buffer = DelayBuffer(cfg.max_delay, self._num_envs, device=self.device)
 #        # all of the envs
-#        self._ALL_INDICES = torch.arange(self._num_envs, dtype=torch.long, device=self._device)
+#        self._ALL_INDICES = torch.arange(self._num_envs, dtype=torch.long, device=self.device)
 
 #    def reset(self, env_ids: Sequence[int]):
 #        super().reset(env_ids)
@@ -46,7 +46,7 @@ from motrix_envs.torch.adapter.utils import configclass
 #            high=self.cfg.max_delay + 1,
 #            size=(num_envs,),
 #            dtype=torch.int,
-#            device=self._device,
+#            device=self.device,
 #        )
 #        # set delays
 #        self.positions_delay_buffer.set_time_lag(time_lags, env_ids)

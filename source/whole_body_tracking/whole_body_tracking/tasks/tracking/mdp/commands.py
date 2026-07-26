@@ -92,19 +92,19 @@ class MotionCommand(CommandTerm):
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self._device = env.device
+        self.device = env.device
 
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body)
         self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body)
         self.body_indexes = torch.tensor(
-            self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self._device
+            self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
         motion_joint_indexes = [_NPZ_JOINT_NAMES.index(name) for name in self.robot.joint_names]
         motion_body_indexes = [_NPZ_BODY_NAMES.index(name) for name in self.cfg.body_names]
         self.motion = MotionLoader(
-            self.cfg.motion_file, motion_joint_indexes, motion_body_indexes, device=self._device
+            self.cfg.motion_file, motion_joint_indexes, motion_body_indexes, device=self.device
         )
         motion_steps_per_control_step = self.motion.fps * env.step_dt
         self.motion_step_stride = max(int(round(motion_steps_per_control_step)), 1)
@@ -113,19 +113,19 @@ class MotionCommand(CommandTerm):
                 "Motion FPS must be an integer multiple of the environment control frequency: "
                 f"fps={self.motion.fps}, ctrl_dt={env.step_dt}."
             )
-        self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self._device)
-        self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self._device)
-        self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self._device)
+        self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
+        self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
 
-        self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_anchor_lin_vel"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self._device)
+        self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
@@ -240,7 +240,7 @@ class MotionCommand(CommandTerm):
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
 
     def _resample_command(self, env_ids: Sequence[int]):
-        phase = sample_uniform(0.0, 1.0, (len(env_ids),), device=self._device)
+        phase = sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device)
         self.time_steps[env_ids] = (phase * (self.motion.time_step_total - 1)).long()
 
         root_pos = self.body_pos_w[:, 0].clone()
@@ -249,14 +249,14 @@ class MotionCommand(CommandTerm):
         root_ang_vel = self.body_ang_vel_w[:, 0].clone()
 
         range_list = [self.cfg.pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
-        ranges = torch.tensor(range_list, device=self._device)
-        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self._device)
+        ranges = torch.tensor(range_list, device=self.device)
+        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
         root_pos[env_ids] += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
         root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
         range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
-        ranges = torch.tensor(range_list, device=self._device)
-        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self._device)
+        ranges = torch.tensor(range_list, device=self.device)
+        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
         root_lin_vel[env_ids] += rand_samples[:, :3]
         root_ang_vel[env_ids] += rand_samples[:, 3:]
 
