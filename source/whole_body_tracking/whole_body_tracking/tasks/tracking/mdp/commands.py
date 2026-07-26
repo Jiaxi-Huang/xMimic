@@ -159,7 +159,7 @@ class MotionCommand(CommandTerm):
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self._device = env.device
+        self.device = env.device
 
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body)
@@ -167,14 +167,14 @@ class MotionCommand(CommandTerm):
         self.body_indexes = torch.tensor(
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0],
             dtype=torch.long,
-            device=self._device,
+            device=self.device,
         )
 
         self.motion = MotionLoader(
             self.cfg.motion_file,
             self.robot.joint_names,
             self.cfg.body_names,
-            device=self._device,
+            device=self.device,
         )
         motion_steps_per_control_step = self.motion.fps * env.step_dt
         self.motion_step_stride = max(int(round(motion_steps_per_control_step)), 1)
@@ -184,30 +184,30 @@ class MotionCommand(CommandTerm):
                 f"fps={self.motion.fps}, ctrl_dt={env.step_dt}."
             )
         self.time_steps = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self._device
+            self.num_envs, dtype=torch.long, device=self.device
         )
         self._adaptive_timestep_sampler = self._build_adaptive_timestep_sampler()
 
         self.metrics["error_anchor_pos"] = torch.zeros(
-            self.num_envs, device=self._device
+            self.num_envs, device=self.device
         )
         self.metrics["error_anchor_rot"] = torch.zeros(
-            self.num_envs, device=self._device
+            self.num_envs, device=self.device
         )
         self.metrics["error_anchor_lin_vel"] = torch.zeros(
-            self.num_envs, device=self._device
+            self.num_envs, device=self.device
         )
         self.metrics["error_anchor_ang_vel"] = torch.zeros(
-            self.num_envs, device=self._device
+            self.num_envs, device=self.device
         )
-        self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self._device)
-        self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self._device)
+        self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
         if self._adaptive_timestep_sampler is not None:
             for name, value in self._adaptive_timestep_sampler.stats().items():
                 self.metrics[name] = torch.full(
-                    (self.num_envs,), value, device=self._device
+                    (self.num_envs,), value, device=self.device
                 )
 
     def _build_adaptive_timestep_sampler(
@@ -406,7 +406,7 @@ class MotionCommand(CommandTerm):
         num_resets = len(env_ids)
         sampler = self._adaptive_timestep_sampler
         if sampler is None:
-            phase = sample_uniform(0.0, 1.0, (num_resets,), device=self._device)
+            phase = sample_uniform(0.0, 1.0, (num_resets,), device=self.device)
             num_control_steps = (
                 self.motion.time_step_total - 1
             ) // self.motion_step_stride
@@ -418,7 +418,7 @@ class MotionCommand(CommandTerm):
                     max_step_exclusive=self.motion.time_step_total - 1,
                 ),
                 dtype=torch.long,
-                device=self._device,
+                device=self.device,
             )
             sampled_steps = (
                 sampled_steps // self.motion_step_stride
@@ -427,7 +427,7 @@ class MotionCommand(CommandTerm):
             sampled_steps.zero_()
         elif self.cfg.start_at_timestep_zero_prob > 0.0:
             start_at_zero = (
-                sample_uniform(0.0, 1.0, (num_resets,), device=self._device)
+                sample_uniform(0.0, 1.0, (num_resets,), device=self.device)
                 < self.cfg.start_at_timestep_zero_prob
             )
             sampled_steps[start_at_zero] = 0
@@ -442,9 +442,9 @@ class MotionCommand(CommandTerm):
             self.cfg.pose_range.get(key, (0.0, 0.0))
             for key in ["x", "y", "z", "roll", "pitch", "yaw"]
         ]
-        ranges = torch.tensor(range_list, device=self._device)
+        ranges = torch.tensor(range_list, device=self.device)
         rand_samples = sample_uniform(
-            ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self._device
+            ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
         )
         root_pos[env_ids] += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(
@@ -455,9 +455,9 @@ class MotionCommand(CommandTerm):
             self.cfg.velocity_range.get(key, (0.0, 0.0))
             for key in ["x", "y", "z", "roll", "pitch", "yaw"]
         ]
-        ranges = torch.tensor(range_list, device=self._device)
+        ranges = torch.tensor(range_list, device=self.device)
         rand_samples = sample_uniform(
-            ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self._device
+            ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
         )
         root_lin_vel[env_ids] += rand_samples[:, :3]
         root_ang_vel[env_ids] += rand_samples[:, 3:]
@@ -471,12 +471,12 @@ class MotionCommand(CommandTerm):
             joint_pos.device,
         )
         model_joint_ids = torch.as_tensor(
-            self.robot.joint_ids, dtype=torch.long, device=self._device
+            self.robot.joint_ids, dtype=torch.long, device=self.device
         )
         hard_joint_pos_limits = torch.as_tensor(
             np.asarray(self._env.model.joint_limits, dtype=np.float32),
             dtype=joint_pos.dtype,
-            device=self._device,
+            device=self.device,
         )[:, model_joint_ids].T
         joint_pos[env_ids] = torch.clip(
             joint_pos[env_ids],
